@@ -18,6 +18,7 @@ library(factoextra)
 library(tidyquant)
 library(tidyverse)
 library(PerformanceAnalytics)
+library(cluster)
 ```
 
 ```{r}
@@ -45,6 +46,7 @@ calculateStatistics <- function(price_data) {
   # Compute metrics per ticker
   # Metrics include: average return, volatility, sharpe ratio, skewness, kurtosis, and asset beta
   summary_stats <- returns_with_market %>%
+    filter(symbol != "SPY") %>% 
     group_by(symbol) %>%
     summarise(
       avg_return   = mean(daily_return, na.rm = TRUE),
@@ -67,10 +69,19 @@ tickers <- c("SPY", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XL
 historical_prices <- tickers %>%
   tq_get(get = "stock.prices",
          from = "2000-01-01",
-         to = "2024-12-31")
+         to = "2024-12-31") %>%
+  group_by(symbol) %>%
+  mutate(
+    # Open-to-Close: Return within the trading day
+    open_close_return = (close / open) - 1,
+    # Close-to-Close: Total daily return
+    close_close_return = close / lag(close) - 1,
+    # Close-to-Open: Overnight return (Previous Close to Current Open)
+    close_open_return = (open / lag(close)) - 1
+  ) %>%
+  ungroup()
 
-# Apply the function
-# Results are stored in the ticker_metric?s_df snake_case variable
+# Results are stored in the ticker_metrics_df
 ticker_metrics_df <- calculateStatistics(historical_prices)
 
 scaled_metrics <- ticker_metrics_df %>% 
@@ -112,6 +123,15 @@ comparison_df <- ticker_metrics_df %>%
   select(symbol, cluster_kmeans, cluster_hclust) %>% 
   arrange(cluster_kmeans)
 
+
+sil_kmean <- silhouette(kmeans_res$cluster, dist(scaled_metrics))
+
+fviz_silhouette(sil_kmean) + 
+
+sil_heir <- silhouette(cutree(cluster_result, k = 3), dist_mat)
+
+fviz_silhouette(sil_heir)
+
 cluster_profiles <- ticker_metrics_df %>% 
   group_by(cluster_kmeans) %>% 
   summarise(
@@ -122,4 +142,22 @@ cluster_profiles <- ticker_metrics_df %>%
     n_assets = n()
   ) %>% 
   arrange(desc(avg_beta))
+
+
 ```
+
+```{r}
+#Assign descriptive names to clusters in comparison_df
+comparison_df <- comparison_df %>%
+mutate(cluster_name = case_match(cluster_kmeans,
+"1" ~ "High Growth",
+"2" ~ "Conservative",
+"3" ~ "Market Performers",
+.default = "Other"                              
+))                                              
+# Apply cluster descriptors to historical_prices
+historical_prices <- historical_prices %>%
+left_join(comparison_df %>% select(symbol, cluster_name), by = "symbol")
+```
+
+
