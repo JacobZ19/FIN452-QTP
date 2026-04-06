@@ -1,0 +1,125 @@
+---
+title: "FIN 452 QTP"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+set.seed(123)
+library(factoextra)
+library(tidyquant)
+library(tidyverse)
+library(PerformanceAnalytics)
+```
+
+```{r}
+# Function to calculate financial metrics for a given dataframe of stock prices
+calculateStatistics <- function(price_data) {
+  # Compute daily log returns
+  returns_df <- price_data %>%
+    group_by(symbol) %>%
+    tq_transmute(select     = adjusted,
+                 mutate_fun = periodReturn,
+                 period     = "daily",
+                 type       = "arithmetic",
+                 col_rename = "daily_return") %>%
+    ungroup()
+
+  # Identify benchmark (SPY) returns for beta calculation
+  market_returns <- returns_df %>%
+    filter(symbol == "SPY") %>%
+    select(date, market_return = daily_return)
+
+  # Join market returns back to the main returns dataframe
+  returns_with_market <- returns_df %>%
+    left_join(market_returns, by = "date")
+
+  # Compute metrics per ticker
+  # Metrics include: average return, volatility, sharpe ratio, skewness, kurtosis, and asset beta
+  summary_stats <- returns_with_market %>%
+    group_by(symbol) %>%
+    summarise(
+      avg_return   = mean(daily_return, na.rm = TRUE),
+      volatility   = sd(daily_return, na.rm = TRUE),
+      sharpe_ratio = if(sd(daily_return, na.rm = TRUE) != 0) mean(daily_return, na.rm = TRUE) / sd(daily_return, na.rm = TRUE) else NA,
+      skewness     = PerformanceAnalytics::skewness(daily_return),
+      kurtosis     = PerformanceAnalytics::kurtosis(daily_return),
+      asset_beta   = cov(daily_return, market_return, use = "complete.obs") / var(market_return, na.rm = TRUE)
+    )
+
+  return(summary_stats)
+}
+```
+
+```{r}
+# Example usage with the tickers previously requested
+tickers <- c("SPY", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY")
+
+# Pull historical data
+historical_prices <- tickers %>%
+  tq_get(get = "stock.prices",
+         from = "2000-01-01",
+         to = "2024-12-31")
+
+# Apply the function
+# Results are stored in the ticker_metric?s_df snake_case variable
+ticker_metrics_df <- calculateStatistics(historical_prices)
+
+scaled_metrics <- ticker_metrics_df %>% 
+  select(avg_return, volatility, sharpe_ratio, asset_beta) %>% 
+  scale()
+
+max_k <- nrow(scaled_metrics) - 1
+
+wss <- map_dbl(1:max_k, function(k){
+  kmeans(scaled_metrics, centers = k, nstart = 25)$tot.withinss
+})
+tibble(k = 1:max_k, wss = wss) %>% 
+  ggplot(aes(x = k, y = wss)) +
+  geom_line() + geom_point() + scale_x_continuous(breaks = 1:max_k)
+```
+
+```{r}
+#Compute Clusters Using K means
+kmeans_res <- kmeans(scaled_metrics, centers = 3, nstart = 25)
+
+ticker_metrics_df <- ticker_metrics_df %>% 
+  mutate(cluster_kmeans = as.factor(kmeans_res$cluster))
+```
+
+```{r}
+#Compute clusters using heirarchical clustering
+dist_mat <- dist(scaled_metrics, method = "euclidean")
+cluster_result <- hclust(dist_mat, method = "ward.D2")
+cluster_result$labels <- ticker_metrics_df$symbol
+
+fviz_dend(cluster_result, k = 3, cex = 0.8, main = "Hierarchical Clustering of Assets", horiz = TRUE, rect = TRUE)
+```
+
+```{r}
+ticker_metrics_df <- ticker_metrics_df %>% 
+  mutate(cluster_hclust = as.factor(cutree(cluster_result, k = 3)))
+
+comparison_df <- ticker_metrics_df %>% 
+  select(symbol, cluster_kmeans, cluster_hclust) %>% 
+  arrange(cluster_kmeans)
+
+cluster_profiles <- ticker_metrics_df %>% 
+  group_by(cluster_kmeans) %>% 
+  summarise(
+    avg_beta = mean(asset_beta),
+    avg_return = mean(avg_return),
+    avg_vol = mean(volatility),
+    avg_sharpe = mean(sharpe_ratio),
+    n_assets = n()
+  ) %>% 
+  arrange(desc(avg_beta))
+```
