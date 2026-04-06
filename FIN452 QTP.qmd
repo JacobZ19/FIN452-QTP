@@ -157,7 +157,137 @@ mutate(cluster_name = case_match(cluster_kmeans,
 ))                                              
 # Apply cluster descriptors to historical_prices
 historical_prices <- historical_prices %>%
-left_join(comparison_df %>% select(symbol, cluster_name), by = "symbol")
+  left_join(comparison_df %>% select(symbol, cluster_name), by = "symbol")
 ```
 
+```{r}
+# Function to denoise prices using a Kalman Filter (Local Level Model)
+kalman_denoise <- function(x, Q = 0.0001, R = 0.01) {
+  # Q: Process noise (how much we expect the 'true' price to move)
+  # R: Measurement noise (how much market jitter we want to filter out)
+
+  n <- length(x)
+  x_hat <- numeric(n) # Filtered state estimates
+  P <- numeric(n)     # Error covariance
+
+  # Initialization
+  x_hat[1] <- x[1]
+  P[1] <- 1.0
+
+  for (t in 2:n) {
+    # 1. Predict Step
+    x_hat_minus <- x_hat[t-1]
+    P_minus <- P[t-1] + Q
+
+    # 2. Update Step (Correction)
+    K <- P_minus / (P_minus + R) # Kalman Gain
+    x_hat[t] <- x_hat_minus + K * (x[t] - x_hat_minus)
+    P[t] <- (1 - K) * P_minus
+  }
+  return(x_hat)
+}
+
+# Apply the Kalman Filter to denoise each ticker's adjusted price
+historical_prices <- historical_prices %>%
+  group_by(symbol) %>%
+  mutate(denoised_close = kalman_denoise(adjusted)) %>%
+  ungroup()
+
+# Visualize the denoising effect for a sample ticker (e.g., SPY)
+historical_prices %>%
+  filter(symbol == "SPY", date >= "2024-01-01") %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = adjusted, color = "Raw Adjusted"), alpha = 0.4) +
+  geom_line(aes(y = denoised_close, color = "Denoised (Kalman)"), size = 1) +
+  theme_tq() +
+  labs(title = "Kalman Filter Denoising: SPY",
+       y = "Price", color = "Series") +
+  scale_color_manual(values = c("Raw Adjusted" = "grey50", "Denoised (Kalman)" = "blue"))
+```
+
+```{r}
+# Remove SPY and create a new dataframe for portfolio analysis
+historical_prices_no_spy <- historical_prices %>%
+  filter(symbol != "SPY")
+
+# Function to backtest a portfolio with monthly rebalancing
+backtestPortfolio <- function(data, cluster_weights, initial_investment) {
+  # cluster_weights: named vector e.g., c("High Growth" = 0.4, "Conservative" = 0.3, "Market Performers" = 0.3)
+  
+  # Identify rebalance dates (first trading day of each month)
+  rebalance_dates <- data %>%
+    mutate(month_year = floor_date(date, "month")) %>%
+    group_by(month_year) %>%
+    filter(date == min(date)) %>%
+    ungroup() %>%
+    pull(date) %>%
+    unique() %>%
+    sort()
+  
+  # Initialize portfolio tracking
+  portfolio_history <- list()
+  current_shares <- data.frame(symbol = unique(data$symbol), shares = 0)
+  
+  # Loop through rebalance dates
+  for (i in seq_along(rebalance_dates)) {
+    current_date <- rebalance_dates[i]
+    
+    # Get prices for today, only keeping tickers with valid prices
+    today_prices <- data %>%
+      filter(date == current_date, !is.na(adjusted)) %>%
+      select(symbol, cluster_name, adjusted)
+    
+    # Dynamically calculate cluster counts for this specific date
+    current_cluster_counts <- today_prices %>%
+      count(cluster_name)
+    
+    if (i == 1) {
+      # Initial investment allocation
+      total_value <- initial_investment
+    } else {
+      # Calculate current value based on previous shares
+      total_value <- today_prices %>%
+        left_join(current_shares, by = "symbol") %>%
+        mutate(value = shares * adjusted) %>%
+        summarise(total = sum(value, na.rm = TRUE)) %>%
+        pull(total)
+    }
+    
+    # Target allocations by cluster
+    targets <- today_prices %>%
+      left_join(current_cluster_counts, by = "cluster_name") %>%
+      mutate(
+        target_cluster_val = total_value * cluster_weights[cluster_name],
+        target_ticker_val = target_cluster_val / n,
+        new_shares = target_ticker_val / adjusted,
+        old_shares = current_shares$shares[match(symbol, current_shares$symbol)],
+        # Set old_shares to 0 if it was NA (newly available ticker)
+        old_shares = ifelse(is.na(old_shares), 0, old_shares),
+        shares_bought_sold = new_shares - old_shares
+      )
+    
+    # Update current shares
+    current_shares$shares <- targets$new_shares[match(current_shares$symbol, targets$symbol)]
+    
+    # Record history
+    portfolio_history[[i]] <- targets %>%
+      mutate(date = current_date, total_portfolio_value = total_value)
+  }
+  
+  # Combine history into a single dataframe
+  final_history <- bind_rows(portfolio_history)
+  
+  # Pivot to wide format as requested
+  wide_history <- final_history %>%
+    select(date, symbol, new_shares, total_portfolio_value) %>%
+    pivot_wider(names_from = symbol, values_from = new_shares) %>%
+    arrange(date)
+    
+  return(wide_history)
+}
+
+# Test function
+weights <- c("High Growth" = 0.4, "Conservative" = 0.3, "Market Performers" = 0.3)
+test <- backtestPortfolio(historical_prices_no_spy, weights, 100000)
+```
 
