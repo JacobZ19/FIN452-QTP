@@ -4,14 +4,6 @@ format: html
 editor: visual
 ---
 
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
 ```{r, echo = FALSE, message = FALSE}
 set.seed(123)
 library(factoextra)
@@ -19,6 +11,7 @@ library(tidyquant)
 library(tidyverse)
 library(PerformanceAnalytics)
 library(cluster)
+library(gt)
 ```
 
 ```{r, echo = FALSE, message = FALSE}
@@ -61,6 +54,12 @@ calculateStatistics <- function(price_data) {
 }
 ```
 
+## Strategy Summary
+
+My strategy revolves around using clusters in conjunction with a momentum based moving average model to identify and prioritize the top performing ETFs. Using the elbow test method I will identify the optimal number of clusters and compare the results of both the k means and hierarchical models. If they demonstrate a strong degree of clustering in the data I will then flesh out the portfolio adjustment process. Each cluster will be assigned a weight based on simulated model performance between 2000-01-01 and 2024-12-31. Each ETF within a particular cluster will be equally weighted with adjustments taking place on the first trading day of each month. Moving averages of denoised closing prices of 100 and 30 trading days will determine if each ETF will be held as a short or long position.
+
+## Cluster Analysis
+
 ```{r, echo = FALSE, message = FALSE}
 # Example usage with the tickers previously requested
 tickers <- c("SPY", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY")
@@ -95,8 +94,14 @@ wss <- map_dbl(1:max_k, function(k){
 })
 tibble(k = 1:max_k, wss = wss) %>% 
   ggplot(aes(x = k, y = wss)) +
-  geom_line(color = "blue", linewidth = 1) + geom_point() + scale_x_continuous(breaks = 1:max_k)
+  geom_line(color = "blue", linewidth = 1) + geom_point(color = "blue") + scale_x_continuous(breaks = 1:max_k)+
+  labs(title = "Optimizing the Number of Clusters",
+       subtitle = "Metrics Tested: Average Return, Volatility, Sharpe Ratio, and Beta") + 
+  xlab("Number of Clusters") + ylab("Within Cluster Sum of Squares")
+
 ```
+
+Using the chart above we can narrow the the acceptable number of clusters to either 3 or 4. We will be proceeding with 3 clusters for further analysis as it will provide a clear delineation between high, mid, and lower growth ETFs.
 
 ```{r, echo = FALSE, message = FALSE}
 #Compute Clusters Using K means
@@ -123,14 +128,23 @@ comparison_df <- ticker_metrics_df %>%
   select(symbol, cluster_kmeans, cluster_hclust) %>% 
   arrange(cluster_kmeans)
 
+comparison_df %>% gt() %>% gt::tab_header(title = "K Means Vs Heirarchical Clustering")
 
+
+
+
+```
+
+As demonstrated by the above chart K Means and Hierarchical Clustering are almost completely aligned with the only discrepancy being the placement of XLI. This indicates that a robust structure still exists between most of the assets but more analysis is required before settling on where to place XLI.
+
+```{r, echo = FALSE, message = FALSE}
 sil_kmean <- silhouette(kmeans_res$cluster, dist(scaled_metrics))
 
-fviz_silhouette(sil_kmean)
+fviz_silhouette(sil_kmean) + labs(title = "K Means Cluster Quality")
 
 sil_heir <- silhouette(cutree(cluster_result, k = 3), dist_mat)
 
-fviz_silhouette(sil_heir)
+fviz_silhouette(sil_heir) + labs(title = "Heirarchical Cluster Quality")
 
 cluster_profiles <- ticker_metrics_df %>% 
   group_by(cluster_kmeans) %>% 
@@ -142,11 +156,12 @@ cluster_profiles <- ticker_metrics_df %>%
     n_assets = n()
   ) %>% 
   arrange(desc(avg_beta))
-
-
 ```
 
+We can see from the above silhouettes that hierarchical clustering has XLI as strongly negative, indicating it is likely misclassified. Therefore th clusters determined by the K Means method will be used for future analysis.
+
 ```{r, echo = FALSE, message = FALSE}
+cluster_profiles %>% gt() %>% tab_header(title = "Cluster Performance Metrics")
 #Assign descriptive names to clusters in comparison_df
 comparison_df <- comparison_df %>%
 mutate(cluster_name = case_match(cluster_kmeans,
@@ -159,6 +174,14 @@ mutate(cluster_name = case_match(cluster_kmeans,
 historical_prices <- historical_prices %>%
   left_join(comparison_df %>% select(symbol, cluster_name), by = "symbol")
 ```
+
+In order to facilitate easier discussion about each cluster they will be given descriptive names based on the relative beta compared to SPY.
+
+-   Cluster 1 = High Growth
+
+-   Cluster 2 = Market Performers
+
+-   Cluster 3 = Conservative
 
 ```{r, echo = FALSE, message = FALSE}
 # Function to denoise prices using a Kalman Filter (Local Level Model)
@@ -192,17 +215,6 @@ historical_prices <- historical_prices %>%
   group_by(symbol) %>%
   mutate(denoised_close = kalman_denoise(adjusted)) %>%
   ungroup()
-
-# Visualize the denoising effect for a sample ticker (e.g., SPY)
-historical_prices %>%
-  filter(symbol == "SPY", date >= "2024-01-01") %>%
-  ggplot(aes(x = date)) +
-  geom_line(aes(y = adjusted, color = "Raw Adjusted"), alpha = 0.4) +
-  geom_line(aes(y = denoised_close, color = "Denoised (Kalman)"), size = 1) +
-  theme_tq() +
-  labs(title = "Kalman Filter Denoising: SPY",
-       y = "Price", color = "Series") +
-  scale_color_manual(values = c("Raw Adjusted" = "grey50", "Denoised (Kalman)" = "blue"))
 ```
 
 ```{r, echo = FALSE, message = FALSE}
@@ -210,85 +222,6 @@ historical_prices %>%
 historical_prices_no_spy <- historical_prices %>%
   filter(symbol != "SPY")
 
-# Function to backtest a portfolio with monthly rebalancing
-backtestPortfolio <- function(data, cluster_weights, initial_investment) {
-  # cluster_weights: named vector e.g., c("High Growth" = 0.4, "Conservative" = 0.3, "Market Performers" = 0.3)
-  
-  # Identify rebalance dates (first trading day of each month)
-  rebalance_dates <- data %>%
-    mutate(month_year = floor_date(date, "month")) %>%
-    group_by(month_year) %>%
-    filter(date == min(date)) %>%
-    ungroup() %>%
-    pull(date) %>%
-    unique() %>%
-    sort()
-  
-  # Initialize portfolio tracking
-  portfolio_history <- list()
-  current_shares <- data.frame(symbol = unique(data$symbol), shares = 0)
-  
-  # Loop through rebalance dates
-  for (i in seq_along(rebalance_dates)) {
-    current_date <- rebalance_dates[i]
-    
-    # Get prices for today, only keeping tickers with valid prices
-    today_prices <- data %>%
-      filter(date == current_date, !is.na(adjusted)) %>%
-      select(symbol, cluster_name, adjusted)
-    
-    # Dynamically calculate cluster counts for this specific date
-    current_cluster_counts <- today_prices %>%
-      count(cluster_name)
-    
-    if (i == 1) {
-      # Initial investment allocation
-      total_value <- initial_investment
-    } else {
-      # Calculate current value based on previous shares
-      total_value <- today_prices %>%
-        left_join(current_shares, by = "symbol") %>%
-        mutate(value = shares * adjusted) %>%
-        summarise(total = sum(value, na.rm = TRUE)) %>%
-        pull(total)
-    }
-    
-    # Target allocations by cluster
-    targets <- today_prices %>%
-      left_join(current_cluster_counts, by = "cluster_name") %>%
-      mutate(
-        target_cluster_val = total_value * cluster_weights[cluster_name],
-        target_ticker_val = target_cluster_val / n,
-        new_shares = target_ticker_val / adjusted,
-        old_shares = current_shares$shares[match(symbol, current_shares$symbol)],
-        # Set old_shares to 0 if it was NA (newly available ticker)
-        old_shares = ifelse(is.na(old_shares), 0, old_shares),
-        shares_bought_sold = new_shares - old_shares
-      )
-    
-    # Update current shares
-    current_shares$shares <- targets$new_shares[match(current_shares$symbol, targets$symbol)]
-    
-    # Record history
-    portfolio_history[[i]] <- targets %>%
-      mutate(date = current_date, total_portfolio_value = total_value)
-  }
-  
-  # Combine history into a single dataframe
-  final_history <- bind_rows(portfolio_history)
-  
-  # Pivot to wide format as requested
-  wide_history <- final_history %>%
-    select(date, symbol, new_shares, total_portfolio_value) %>%
-    pivot_wider(names_from = symbol, values_from = new_shares) %>%
-    arrange(date)
-    
-  return(wide_history)
-}
-
-# Test function
-weights <- c("High Growth" = 0.4, "Conservative" = 0.3, "Market Performers" = 0.3)
-test <- backtestPortfolio(historical_prices_no_spy, weights, 100000)
 ```
 
 ```{r, echo = FALSE, message = FALSE}
@@ -322,13 +255,6 @@ historical_prices_no_spy <- historical_prices_no_spy %>%
   mutate(cum_ret_monthly = cumprod(1 + coalesce(total_ret, 0))) %>%
   ungroup() %>%
   select(-month)
-
-# View results for a sample ticker
-historical_prices_no_spy %>% 
-  filter(symbol == "XLK") %>% 
-  select(date, symbol, denoised_close, signal, pos, total_ret, cum_ret, cum_ret_monthly) %>% 
-  filter(!is.na(signal)) %>% 
-  head(10)
 ```
 
 ```{r, echo = FALSE, message = FALSE}
@@ -416,18 +342,11 @@ backtestStrategyPortfolio <- function(data, cluster_weights, initial_investment)
   return(daily_portfolio)
 }
 
-# Run the integrated backtest
-weights <- c("High Growth" = 0.4, "Conservative" = 0.3, "Market Performers" = 0.3)
-strategy_backtest <- backtestStrategyPortfolio(historical_prices_no_spy, weights, 100000)
-
-# Plot Cumulative Returns
-ggplot(strategy_backtest, aes(x = date, y = cum_ret)) +
-  geom_line(color = "darkgreen") +
-  theme_tq() +
-  labs(title = "Integrated Portfolio Performance: SMA Strategy + Monthly Rebalancing",
-       subtitle = "Accounting for Long/Short Positions per Asset",
-       y = "Cumulative Return", x = "Date")
 ```
+
+## Optimization
+
+Now that clusters have been identified it is time to optimize the balance between them. As mentioned in the summary each ETF inside a cluster is equally weighted, for example if each cluster made up 33% of the portfolio, each of the four ETFs in the High Growth cluster would make up 25% of that 33% at every rebalancing day. Different portfolio weights will be simulated over the training period and then evaluated based on their Sharpe Ratio.
 
 ```{r, echo = FALSE, message = FALSE}
 # Optimization: Grid Search for Optimal Cluster Weights
@@ -467,11 +386,10 @@ optimization_results <- weight_grid %>%
 
 # 3. Identify the best weight combination
 best_weights <- optimization_results %>%
-  arrange(desc(sharpe_ratio)) %>%
-  head(1)
-
-print("Optimal Weights Found:")
-print(best_weights)
+  arrange(desc(sharpe_ratio)) 
+  best_weights %>% 
+  gt() %>% 
+  tab_header(title = "Optimal Cluster Weights")
 
 # 4. Plot the optimization surface
 ggplot(optimization_results, aes(x = High_Growth, y = Conservative, fill = sharpe_ratio)) +
@@ -484,3 +402,40 @@ ggplot(optimization_results, aes(x = High_Growth, y = Conservative, fill = sharp
        fill = "Sharpe Ratio") +
   theme_minimal()
 ```
+
+From the above analysis we can see that based on Sharpe Ratio the optimal decision would be to focus solely the High Growth cluster. To ensure a more complete view of the models performance we will evaluate the cumulative returns of the top three Sharpe Ratios.
+
+```{r, echo = FALSE, message = FALSE}
+weights_opt <- c("High Growth" = as.numeric(best_weights[1,1]), "Conservative" = as.numeric(best_weights[1,2]), "Market Performers" = as.numeric(best_weights[1,3]))
+opt_backtest <- backtestStrategyPortfolio(historical_prices_no_spy, weights_opt, 100000)
+
+# Plot Cumulative Returns
+ggplot(opt_backtest, aes(x = date, y = cum_ret)) +
+  geom_line(color = "darkgreen") +
+  theme_tq() +
+  labs(title = "Optimal Sharpe Ratio Portfolio",
+       subtitle = "High Growth = 1, Conservative = 0, Market Performers = 0",
+       y = "Cumulative Return", x = "Date")
+
+weights_2nd <- c("High Growth" = as.numeric(best_weights[2,1]), "Conservative" = as.numeric(best_weights[2,2]), "Market Performers" = as.numeric(best_weights[2,3]))
+two_backtest <- backtestStrategyPortfolio(historical_prices_no_spy, weights_2nd, 100000)
+
+ggplot(two_backtest, aes(x = date, y = cum_ret)) +
+  geom_line(color = "orange") +
+  theme_tq() +
+  labs(title = "Second Best Sharpe Ratio Portfolio",
+       subtitle = "High Growth = 0.8, Conservative = 0.2, Market Performers = 0",
+       y = "Cumulative Return", x = "Date")
+
+weights_3rd <- c("High Growth" = as.numeric(best_weights[3,1]), "Conservative" = as.numeric(best_weights[3,2]), "Market Performers" = as.numeric(best_weights[3,3]))
+three_backtest <- backtestStrategyPortfolio(historical_prices_no_spy, weights_3rd, 100000)
+
+ggplot(three_backtest, aes(x = date, y = cum_ret)) +
+  geom_line(color = "purple") +
+  theme_tq() +
+  labs(title = "Third Best Sharpe Ratio Portfolio",
+       subtitle = "High Growth = 0.8, Conservative = 0, Market Performers = 0.2",
+       y = "Cumulative Return", x = "Date")
+```
+
+The solely High Growth strategy still performed the best in terms of overall returns; however the above charts also demonstrates that focusing solely on a handful of assets also carries its fair share of risk. There are several large and fast swings in the cumulative returns over the training set. Still mixing in either the Conservative or Market Performers clusters does not provide enough protection to make it worth giving up the extra returns. Therefore the High Growth Strategy will be used on test set.
