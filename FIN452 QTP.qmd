@@ -12,7 +12,7 @@ Quarto enables you to weave together content and executable code into a finished
 
 When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 set.seed(123)
 library(factoextra)
 library(tidyquant)
@@ -21,7 +21,7 @@ library(PerformanceAnalytics)
 library(cluster)
 ```
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 # Function to calculate financial metrics for a given dataframe of stock prices
 calculateStatistics <- function(price_data) {
   # Compute daily log returns
@@ -61,7 +61,7 @@ calculateStatistics <- function(price_data) {
 }
 ```
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 # Example usage with the tickers previously requested
 tickers <- c("SPY", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY")
 
@@ -95,10 +95,10 @@ wss <- map_dbl(1:max_k, function(k){
 })
 tibble(k = 1:max_k, wss = wss) %>% 
   ggplot(aes(x = k, y = wss)) +
-  geom_line() + geom_point() + scale_x_continuous(breaks = 1:max_k)
+  geom_line(color = "blue", linewidth = 1) + geom_point() + scale_x_continuous(breaks = 1:max_k)
 ```
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 #Compute Clusters Using K means
 kmeans_res <- kmeans(scaled_metrics, centers = 3, nstart = 25)
 
@@ -106,7 +106,7 @@ ticker_metrics_df <- ticker_metrics_df %>%
   mutate(cluster_kmeans = as.factor(kmeans_res$cluster))
 ```
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 #Compute clusters using heirarchical clustering
 dist_mat <- dist(scaled_metrics, method = "euclidean")
 cluster_result <- hclust(dist_mat, method = "ward.D2")
@@ -115,7 +115,7 @@ cluster_result$labels <- ticker_metrics_df$symbol
 fviz_dend(cluster_result, k = 3, cex = 0.8, main = "Hierarchical Clustering of Assets", horiz = TRUE, rect = TRUE)
 ```
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 ticker_metrics_df <- ticker_metrics_df %>% 
   mutate(cluster_hclust = as.factor(cutree(cluster_result, k = 3)))
 
@@ -126,7 +126,7 @@ comparison_df <- ticker_metrics_df %>%
 
 sil_kmean <- silhouette(kmeans_res$cluster, dist(scaled_metrics))
 
-fviz_silhouette(sil_kmean) + 
+fviz_silhouette(sil_kmean)
 
 sil_heir <- silhouette(cutree(cluster_result, k = 3), dist_mat)
 
@@ -146,7 +146,7 @@ cluster_profiles <- ticker_metrics_df %>%
 
 ```
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 #Assign descriptive names to clusters in comparison_df
 comparison_df <- comparison_df %>%
 mutate(cluster_name = case_match(cluster_kmeans,
@@ -160,7 +160,7 @@ historical_prices <- historical_prices %>%
   left_join(comparison_df %>% select(symbol, cluster_name), by = "symbol")
 ```
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 # Function to denoise prices using a Kalman Filter (Local Level Model)
 kalman_denoise <- function(x, Q = 0.0001, R = 0.01) {
   # Q: Process noise (how much we expect the 'true' price to move)
@@ -205,7 +205,7 @@ historical_prices %>%
   scale_color_manual(values = c("Raw Adjusted" = "grey50", "Denoised (Kalman)" = "blue"))
 ```
 
-```{r}
+```{r, echo = FALSE, message = FALSE}
 # Remove SPY and create a new dataframe for portfolio analysis
 historical_prices_no_spy <- historical_prices %>%
   filter(symbol != "SPY")
@@ -291,3 +291,196 @@ weights <- c("High Growth" = 0.4, "Conservative" = 0.3, "Market Performers" = 0.
 test <- backtestPortfolio(historical_prices_no_spy, weights, 100000)
 ```
 
+```{r, echo = FALSE, message = FALSE}
+# Simple Moving Average Trading Strategy
+# Par 1: 30-day SMA of denoised_close
+# Par 2: 100-day SMA of denoised_close
+# Signal: 1 if Par 1 > Par 2, -1 if Par 1 < Par 2
+
+historical_prices_no_spy <- historical_prices_no_spy %>%
+  group_by(symbol) %>%
+  mutate(
+    par1 = TTR::SMA(denoised_close, n = 30),
+    par2 = TTR::SMA(denoised_close, n = 100),
+    signal = case_when(
+      par1 > par2 ~ 1,
+      par1 < par2 ~ -1,
+      .default = NA_real_
+    ),
+    # Current position: start with 1 (long) and follow signal when available
+    pos = if_else(is.na(signal), 1, signal),
+    # Returns of existing positions
+    return_exist = if_else(pos == lag(pos, default = 1),close_close_return * pos, 0),
+    # Return on portfolio changes (rebalancing at the open)
+    new_returns = if_else(pos != lag(pos, default = 1), pos * open_close_return, 0),
+    # Total return
+    total_ret = return_exist + new_returns,
+    # Cumulative returns
+    cum_ret = cumprod(1 + coalesce(total_ret, 0))
+  ) %>%
+  group_by(symbol, month = floor_date(date, "month")) %>%
+  mutate(cum_ret_monthly = cumprod(1 + coalesce(total_ret, 0))) %>%
+  ungroup() %>%
+  select(-month)
+
+# View results for a sample ticker
+historical_prices_no_spy %>% 
+  filter(symbol == "XLK") %>% 
+  select(date, symbol, denoised_close, signal, pos, total_ret, cum_ret, cum_ret_monthly) %>% 
+  filter(!is.na(signal)) %>% 
+  head(10)
+```
+
+```{r, echo = FALSE, message = FALSE}
+# Integrated Backtesting: Monthly Rebalancing with Daily SMA Long/Short Strategy
+# This merges the signal logic into the portfolio value tracking
+
+backtestStrategyPortfolio <- function(data, cluster_weights, initial_investment) {
+  # 1. Identify rebalance dates (first trading day of each month)
+  rebalance_dates <- data %>%
+    mutate(month_year = floor_date(date, "month")) %>%
+    group_by(month_year) %>%
+    filter(date == min(date)) %>%
+    ungroup() %>%
+    pull(date) %>%
+    unique() %>%
+    sort()
+  
+  all_dates <- sort(unique(data$date))
+  all_symbols <- unique(data$symbol)
+  
+  daily_portfolio <- data.frame(date = all_dates, total_value = NA_real_)
+  
+  # ticker_values: dollar value of each ticker's position contribution
+  ticker_values <- setNames(rep(0, length(all_symbols)), all_symbols)
+  # ticker_pos: direction (1 for long, -1 for short)
+  ticker_pos <- setNames(rep(1, length(all_symbols)), all_symbols)
+  
+  current_total_val <- initial_investment
+  
+  for (i in seq_along(all_dates)) {
+    today <- all_dates[i]
+    today_data <- data[data$date == today, ]
+    
+    if (i == 1) {
+      # Initialize at open of first day
+      available <- today_data[!is.na(today_data$open) & !is.na(today_data$cluster_name) & !is.na(today_data$pos), ]
+      counts <- table(available$cluster_name)
+      if (nrow(available) > 0) {
+        weights_vec <- cluster_weights[available$cluster_name]
+        counts_vec <- as.numeric(counts[available$cluster_name])
+        ticker_values[available$symbol] <- (initial_investment * weights_vec) / counts_vec
+        ticker_pos[available$symbol] <- available$pos
+      }
+    } else {
+      # A. Overnight performance (yesterday's positions)
+      ret_co <- today_data$close_open_return[match(names(ticker_values), today_data$symbol)]
+      ticker_values <- ticker_values * (1 + ticker_pos * coalesce(ret_co, 0))
+      current_total_val <- sum(ticker_values)
+      
+      # B. Monthly Rebalance OR Daily Position Update
+      if (today %in% rebalance_dates) {
+        # Dynamically identify available tickers today
+        available <- today_data[!is.na(today_data$open) & !is.na(today_data$cluster_name) & !is.na(today_data$pos), ]
+        counts <- table(available$cluster_name)
+        ticker_values[] <- 0 # Exit old positions
+        if (nrow(available) > 0) {
+          weights_vec <- cluster_weights[available$cluster_name]
+          counts_vec <- as.numeric(counts[available$cluster_name])
+          ticker_values[available$symbol] <- (current_total_val * weights_vec) / counts_vec
+          ticker_pos[available$symbol] <- available$pos
+        }
+      } else {
+        # Switch direction if signal changed
+        new_pos <- today_data$pos[match(names(ticker_pos), today_data$symbol)]
+        update_mask <- !is.na(new_pos) & ticker_values != 0
+        ticker_pos[update_mask] <- new_pos[update_mask]
+      }
+    }
+    
+    # C. Intraday performance (today's updated positions)
+    ret_oc <- today_data$open_close_return[match(names(ticker_values), today_data$symbol)]
+    ticker_values <- ticker_values * (1 + ticker_pos * coalesce(ret_oc, 0))
+    current_total_val <- sum(ticker_values)
+    
+    daily_portfolio$total_value[i] <- current_total_val
+  }
+  
+  # Calculate Returns
+  daily_portfolio <- daily_portfolio %>%
+    mutate(
+      daily_ret = total_value / lag(total_value) - 1,
+      cum_ret = cumprod(1 + coalesce(daily_ret, 0))
+    )
+  
+  return(daily_portfolio)
+}
+
+# Run the integrated backtest
+weights <- c("High Growth" = 0.4, "Conservative" = 0.3, "Market Performers" = 0.3)
+strategy_backtest <- backtestStrategyPortfolio(historical_prices_no_spy, weights, 100000)
+
+# Plot Cumulative Returns
+ggplot(strategy_backtest, aes(x = date, y = cum_ret)) +
+  geom_line(color = "darkgreen") +
+  theme_tq() +
+  labs(title = "Integrated Portfolio Performance: SMA Strategy + Monthly Rebalancing",
+       subtitle = "Accounting for Long/Short Positions per Asset",
+       y = "Cumulative Return", x = "Date")
+```
+
+```{r, echo = FALSE, message = FALSE}
+# Optimization: Grid Search for Optimal Cluster Weights
+# We vary weights for the three clusters to maximize the Annualized Sharpe Ratio
+
+# 1. Define the grid of weights (summing to 1)
+weight_grid <- expand.grid(
+  High_Growth = seq(0, 1, by = 0.2),
+  Conservative = seq(0, 1, by = 0.2)
+) %>%
+  mutate(Market_Performers = 1 - (High_Growth + Conservative)) %>%
+  filter(Market_Performers >= 0)
+
+# 2. Iterate through the grid and calculate Sharpe Ratio
+# Note: This might take a moment depending on the grid density
+optimization_results <- weight_grid %>%
+  rowwise() %>%
+  mutate(
+    sharpe_ratio = {
+      w_vec <- c("High Growth" = High_Growth, 
+                 "Conservative" = Conservative, 
+                 "Market Performers" = Market_Performers)
+      
+      # Run backtest for these weights
+      bt_res <- backtestStrategyPortfolio(historical_prices_no_spy, w_vec, 100000)
+      
+      # Calculate Annualized Sharpe Ratio
+      # (Mean daily return / SD daily return) * sqrt(252)
+      if (all(is.na(bt_res$daily_ret))) {
+        NA_real_
+      } else {
+        mean(bt_res$daily_ret, na.rm = TRUE) / sd(bt_res$daily_ret, na.rm = TRUE) * sqrt(252)
+      }
+    }
+  ) %>%
+  ungroup()
+
+# 3. Identify the best weight combination
+best_weights <- optimization_results %>%
+  arrange(desc(sharpe_ratio)) %>%
+  head(1)
+
+print("Optimal Weights Found:")
+print(best_weights)
+
+# 4. Plot the optimization surface
+ggplot(optimization_results, aes(x = High_Growth, y = Conservative, fill = sharpe_ratio)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  labs(title = "Cluster Weight Optimization Surface",
+       subtitle = "Maximizing Annualized Sharpe Ratio",
+       x = "Weight: High Growth",
+       y = "Weight: Conservative",
+       fill = "Sharpe Ratio") +
+  theme_minimal()
+```
