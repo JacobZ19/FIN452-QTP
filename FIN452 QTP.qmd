@@ -1,7 +1,11 @@
 ---
-title: "FIN 452 QTP"
+title: "Sector ETFs Quantiative Trading Model"
+author: "Jacob Zarowny"
+date: Sys.Date()
 format: html
+lightbox: true
 editor: visual
+embed-resources: true
 ---
 
 ```{r, echo = FALSE, message = FALSE}
@@ -57,6 +61,8 @@ calculateStatistics <- function(price_data) {
 ## Strategy Summary
 
 My strategy revolves around using clusters in conjunction with a momentum based moving average model to identify and prioritize the top performing ETFs. Using the elbow test method I will identify the optimal number of clusters and compare the results of both the k means and hierarchical models. If they demonstrate a strong degree of clustering in the data I will then flesh out the portfolio adjustment process. Each cluster will be assigned a weight based on simulated model performance between 2000-01-01 and 2024-12-31. Each ETF within a particular cluster will be equally weighted with adjustments taking place on the first trading day of each month. Moving averages of denoised closing prices of 100 and 30 trading days will determine if each ETF will be held as a short or long position.
+
+![](Hierarchical%20ETF%20Clustering-2026-04-07-110637.png)
 
 ## Cluster Analysis
 
@@ -158,7 +164,7 @@ cluster_profiles <- ticker_metrics_df %>%
   arrange(desc(avg_beta))
 ```
 
-We can see from the above silhouettes that hierarchical clustering has XLI as strongly negative, indicating it is likely misclassified. Therefore th clusters determined by the K Means method will be used for future analysis.
+We can see from the above silhouettes that hierarchical clustering has XLI as strongly negative, indicating it is likely misclassified. Therefore the clusters determined by the K Means method will be used for future analysis.
 
 ```{r, echo = FALSE, message = FALSE}
 cluster_profiles %>% gt() %>% tab_header(title = "Cluster Performance Metrics")
@@ -403,7 +409,7 @@ ggplot(optimization_results, aes(x = High_Growth, y = Conservative, fill = sharp
   theme_minimal()
 ```
 
-From the above analysis we can see that based on Sharpe Ratio the optimal decision would be to focus solely the High Growth cluster. To ensure a more complete view of the models performance we will evaluate the cumulative returns of the top three Sharpe Ratios.
+From the above analysis we can see that based on Sharpe Ratio the optimal decision would be to focus solely the High Growth cluster. This results in a balanced portfolio consisting of XLB, XLE, XLF, and XLK. To ensure a more complete view of the models performance we will evaluate the cumulative returns of the top three Sharpe Ratios.
 
 ```{r, echo = FALSE, message = FALSE}
 weights_opt <- c("High Growth" = as.numeric(best_weights[1,1]), "Conservative" = as.numeric(best_weights[1,2]), "Market Performers" = as.numeric(best_weights[1,3]))
@@ -439,3 +445,68 @@ ggplot(three_backtest, aes(x = date, y = cum_ret)) +
 ```
 
 The solely High Growth strategy still performed the best in terms of overall returns; however the above charts also demonstrates that focusing solely on a handful of assets also carries its fair share of risk. There are several large and fast swings in the cumulative returns over the training set. Still mixing in either the Conservative or Market Performers clusters does not provide enough protection to make it worth giving up the extra returns. Therefore the High Growth Strategy will be used on test set.
+
+## Test Results
+
+```{r, echo = FALSE, message = FALSE}
+test_prices <- tickers %>%
+  tq_get(get = "stock.prices",
+         from = "2025-01-01",
+         to = Sys.Date()) %>%
+  group_by(symbol) %>%
+  mutate(
+    # Open-to-Close: Return within the trading day
+    open_close_return = (close / open) - 1,
+    # Close-to-Close: Total daily return
+    close_close_return = close / lag(close) - 1,
+    # Close-to-Open: Overnight return (Previous Close to Current Open)
+    close_open_return = (open / lag(close)) - 1
+  ) %>%
+  ungroup() %>% 
+  left_join(comparison_df %>% select(symbol, cluster_name), by = "symbol") %>% 
+  group_by(symbol) %>%
+  mutate(denoised_close = kalman_denoise(adjusted)) %>%
+  ungroup() %>% 
+  filter(symbol != "SPY") %>% 
+  group_by(symbol) %>%
+  mutate(
+    par1 = TTR::SMA(denoised_close, n = 30),
+    par2 = TTR::SMA(denoised_close, n = 100),
+    signal = case_when(
+      par1 > par2 ~ 1,
+      par1 < par2 ~ -1,
+      .default = NA_real_
+    ),
+    # Current position: start with 1 (long) and follow signal when available
+    pos = if_else(is.na(signal), 1, signal),
+    # Returns of existing positions
+    return_exist = if_else(pos == lag(pos, default = 1),close_close_return * pos, 0),
+    # Return on portfolio changes (rebalancing at the open)
+    new_returns = if_else(pos != lag(pos, default = 1), pos * open_close_return, 0),
+    # Total return
+    total_ret = return_exist + new_returns,
+    # Cumulative returns
+    cum_ret = cumprod(1 + coalesce(total_ret, 0))
+  ) %>%
+  group_by(symbol, month = floor_date(date, "month")) %>%
+  mutate(cum_ret_monthly = cumprod(1 + coalesce(total_ret, 0))) %>%
+  ungroup() %>%
+  select(-month)
+
+test_performace <- backtestStrategyPortfolio(test_prices, weights_opt, 100000)
+ggplot(test_performace, aes(x = date, y = cum_ret)) +
+  geom_line(color = "lightblue", linewidth = 1) +
+  theme_tq() +
+  labs(title = "Test Set Performance",
+       subtitle = "High Growth = 1, Conservative = 0, Market Performers = 0",
+       y = "Cumulative Return", x = "Date")
+
+```
+
+As we can see from the chart above the model performs quite well in the test set. Cumulative returns are positive for the majority of the year and a quarter period. At the end of the test period the total cumulative return is a respectable 7.67%. The downturn in early 2025 can likely be attributed to the widespread economic uncertainty resulting from the US President Donald Trump's sweeping tariff policies. Otherwise a noticeable upward trajectory was present throughout the test period.
+
+## Lessons Learned
+
+One of my big takeaways from the project was that I need to work on getting more comfortable with larger risks. When my model returned going all in on the High Growth cluster as the optimal move I was skeptical likely due to my fairly low risk tolerance; however I did come to realize that the gains on the upswings were high enough that the strategy could weather the periodical downturn due to its larger cushion.
+
+I found this project very similar to the commodity trading project in FIN 440 but also quite different in some key aspects. For one I found that there was far less outside data to incorporate in this project, and most of the focus was on the financial instruments themselves. Even then, I was juggling considerable more assets than I was in my 440 project, and I also had to account for instruments like XLRE and XLC not being available for the whole of the training period. That proved an issue in the early tests of my trading logic, especially for the monthly portfolio balancing. They were absent in terms of assets, but still present as a divisor in cluster balancing formula. This caused large slices of portfolio value to be lost every month. The addition of AI tools also proved very helpful for this project, I was able to think up a more successful and complex model for this project than FIN 440 in large part because I did not need to commit as much time to the implementation itself. I also found a project like this great for finding the limits of what AI can and cannot help you with. With specific instructions it can eliminate much of the grunt work but at a high level this project would be too abstract for it to find a viable solution on its own.
